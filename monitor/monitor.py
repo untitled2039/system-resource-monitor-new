@@ -337,8 +337,7 @@ def update_graph(self):
                 self.ax4.set_ylim(0, 100)
 
             import matplotlib.pyplot as plt
-            plt.tight_layout()
-            self.canvas.draw()
+            self.canvas.draw_idle()
             
         except Exception:
             pass

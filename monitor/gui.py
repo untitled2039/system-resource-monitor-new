@@ -1,184 +1,240 @@
-import tkinter as tk
-from tkinter import ttk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import customtkinter as ctk
+from tkinter import messagebox
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from utils.utils import gather_system_info
 import requests
-from tkinter import messagebox
+
+# ---- 전역 테마 (바이브코딩 다크 스타일) ----
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+# 색상 팔레트
+BG        = "#0f1117"   # 가장 바깥 배경
+CARD      = "#1a1b26"   # 카드(도시락칸) 배경
+CARD_SOFT = "#20222e"   # 입력 필드 등 안쪽
+ACCENT    = "#7aa2f7"   # 포인트
+TEXT      = "#c0caf5"
+TEXT_DIM  = "#565f89"
+GOOD      = "#9ece6a"
+BAD       = "#f7768e"
 
 def create_gui(self):
-    # Configure matplotlib for modern look
-    plt.style.use('default')
-    
-    # Main container with padding
-    main_frame = ttk.Frame(self.root)
-    main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-    
-    # Tab control with modern styling
-    self.tab_control = ttk.Notebook(main_frame)
-    self.tab_control.pack(expand=1, fill="both")
+    self.root.configure(fg_color=BG)
 
-    # ==================== MONITORING TAB ====================
-    monitor_tab = ttk.Frame(self.tab_control)
-    self.tab_control.add(monitor_tab, text="📊 Resource Monitor")
+    # 공통 폰트
+    font_title = ctk.CTkFont(family="Segoe UI", size=18, weight="bold")
+    font_label = ctk.CTkFont(family="Segoe UI", size=13)
+    font_bold  = ctk.CTkFont(family="Segoe UI", size=14, weight="bold")
+    font_mono  = ctk.CTkFont(family="Consolas", size=12)
 
-    # Control Panel
-    control_frame = ttk.LabelFrame(monitor_tab, text="Control Panel", padding=15)
-    control_frame.pack(fill="x", pady=(0, 10))
+    # ==================== 메인 컨테이너 ====================
+    main_frame = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
+    main_frame.pack(fill="both", expand=True, padx=16, pady=16)
 
-    # Status indicator
-    status_frame = ttk.Frame(control_frame)
-    status_frame.pack(fill="x", pady=(0, 10))
-    
-    self.status_label = ttk.Label(status_frame, text="🔴 Monitoring Stopped", 
-                                 font=('Segoe UI', 10, 'bold'))
-    self.status_label.pack(side="left")
+    # 탭 뷰 (둥근 모서리 + 다크)
+    self.tab_control = ctk.CTkTabview(
+        main_frame,
+        fg_color=CARD,
+        segmented_button_fg_color=CARD_SOFT,
+        segmented_button_selected_color=ACCENT,
+        segmented_button_selected_hover_color=ACCENT,
+        text_color=TEXT,
+        corner_radius=16,
+    )
+    self.tab_control.pack(expand=True, fill="both")
 
-    # Threshold settings in a grid
-    threshold_grid = ttk.Frame(control_frame)
-    threshold_grid.pack(fill="x", pady=10)
+    monitor_tab = self.tab_control.add("📊 Resource Monitor")
+    processes_tab = self.tab_control.add("🔧 Top Processes")
 
-    # CPU Threshold
-    ttk.Label(threshold_grid, text="CPU Threshold (%):").grid(
-        row=0, column=0, padx=5, pady=5, sticky="w")
-    cpu_entry = ttk.Entry(threshold_grid, width=10)
-    cpu_entry.grid(row=0, column=1, padx=5, pady=5)
-    cpu_entry.insert(0, str(self.CPU_THRESHOLD))
+    # ======================================================
+    #  MONITORING TAB
+    # ======================================================
 
-    # Memory Threshold
-    ttk.Label(threshold_grid, text="Memory Threshold (%):").grid(
-        row=0, column=2, padx=5, pady=5, sticky="w")
-    memory_entry = ttk.Entry(threshold_grid, width=10)
-    memory_entry.grid(row=0, column=3, padx=5, pady=5)
-    memory_entry.insert(0, str(self.MEMORY_THRESHOLD))
+    # ---- Control Panel 카드 ----
+    control_frame = ctk.CTkFrame(monitor_tab, fg_color=CARD, corner_radius=16)
+    control_frame.pack(fill="x", pady=(0, 14), padx=4)
 
-    # GPU Threshold
-    ttk.Label(threshold_grid, text="GPU Threshold (%):").grid(
-        row=1, column=0, padx=5, pady=5, sticky="w")
-    gpu_entry = ttk.Entry(threshold_grid, width=10)
-    gpu_entry.grid(row=1, column=1, padx=5, pady=5)
-    gpu_entry.insert(0, str(self.GPU_THRESHOLD))
+    ctk.CTkLabel(control_frame, text="Control Panel",
+                 font=font_title, text_color=TEXT).pack(
+        anchor="w", padx=20, pady=(16, 4))
 
-    # Monitoring Interval
-    ttk.Label(threshold_grid, text="Update Interval (s):").grid(
-        row=1, column=2, padx=5, pady=5, sticky="w")
-    interval_entry = ttk.Entry(threshold_grid, width=10)
-    interval_entry.grid(row=1, column=3, padx=5, pady=5)
-    interval_entry.insert(0, str(self.CPU_MON_INTERVAL))
+    # 상태 표시
+    self.status_label = ctk.CTkLabel(
+        control_frame, text="● Monitoring Stopped",
+        font=font_bold, text_color=BAD)
+    self.status_label.pack(anchor="w", padx=20, pady=(0, 10))
 
-    # Threshold save functions
-    def save_cpu_threshold(event):
+    # ---- 임계값 "도시락통" 그리드 (2x2 카드) ----
+    threshold_grid = ctk.CTkFrame(control_frame, fg_color="transparent")
+    threshold_grid.pack(fill="x", padx=16, pady=(0, 12))
+    for c in range(2):
+        threshold_grid.grid_columnconfigure(c, weight=1, uniform="cell")
+
+    def make_field(parent, label, initial):
+        cell = ctk.CTkFrame(parent, fg_color=CARD_SOFT, corner_radius=12)
+        ctk.CTkLabel(cell, text=label, font=font_label,
+                     text_color=TEXT_DIM).pack(anchor="w", padx=16, pady=(12, 2))
+        entry = ctk.CTkEntry(
+            cell, width=120, height=34, corner_radius=10,
+            fg_color=CARD, border_color=TEXT_DIM, border_width=1,
+            text_color=TEXT, font=font_label)
+        entry.insert(0, str(initial))
+        entry.pack(anchor="w", padx=16, pady=(0, 14))
+        return cell, entry
+
+    cpu_cell, cpu_entry = make_field(threshold_grid, "CPU Threshold (%)", self.CPU_THRESHOLD)
+    mem_cell, memory_entry = make_field(threshold_grid, "Memory Threshold (%)", self.MEMORY_THRESHOLD)
+    gpu_cell, gpu_entry = make_field(threshold_grid, "GPU Threshold (%)", self.GPU_THRESHOLD)
+    int_cell, interval_entry = make_field(threshold_grid, "Update Interval (s)", self.CPU_MON_INTERVAL)
+
+    cpu_cell.grid(row=0, column=0, padx=6, pady=6, sticky="nsew")
+    mem_cell.grid(row=0, column=1, padx=6, pady=6, sticky="nsew")
+    gpu_cell.grid(row=1, column=0, padx=6, pady=6, sticky="nsew")
+    int_cell.grid(row=1, column=1, padx=6, pady=6, sticky="nsew")
+
+    def save_cpu_threshold(event=None):
         try:
             self.CPU_THRESHOLD = float(cpu_entry.get())
         except ValueError:
             cpu_entry.delete(0, "end")
             cpu_entry.insert(0, str(self.CPU_THRESHOLD))
 
-    def save_memory_threshold(event):
+    def save_memory_threshold(event=None):
         try:
             self.MEMORY_THRESHOLD = float(memory_entry.get())
         except ValueError:
             memory_entry.delete(0, "end")
             memory_entry.insert(0, str(self.MEMORY_THRESHOLD))
 
-    def save_gpu_threshold(event):
+    def save_gpu_threshold(event=None):
         try:
             self.GPU_THRESHOLD = float(gpu_entry.get())
         except ValueError:
             gpu_entry.delete(0, "end")
             gpu_entry.insert(0, str(self.GPU_THRESHOLD))
 
-    def save_interval(event):
+    def save_interval(event=None):
         try:
             self.CPU_MON_INTERVAL = float(interval_entry.get())
         except ValueError:
             interval_entry.delete(0, "end")
             interval_entry.insert(0, str(self.CPU_MON_INTERVAL))
 
-    # Bind events
-    cpu_entry.bind('<FocusOut>', save_cpu_threshold)
-    memory_entry.bind('<FocusOut>', save_memory_threshold)
-    gpu_entry.bind('<FocusOut>', save_gpu_threshold)
-    interval_entry.bind('<FocusOut>', save_interval)
+    cpu_entry.bind("<Return>", save_cpu_threshold)
+    memory_entry.bind("<Return>", save_memory_threshold)
+    gpu_entry.bind("<Return>", save_gpu_threshold)
+    interval_entry.bind("<Return>", save_interval)
 
-    # Control buttons
-    button_frame = ttk.Frame(control_frame)
-    button_frame.pack(pady=10)
+    # ---- 제어 버튼 ----
+    button_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+    button_frame.pack(anchor="w", padx=20, pady=(0, 16))
 
-    self.start_button = ttk.Button(button_frame, text="▶ Start Monitoring", 
-                                  command=self.start_monitoring, style='Modern.TButton')
-    self.start_button.pack(side="left", padx=5)
+    def wrap_status(start):
+        def _cmd():
+            if start:
+                self.start_monitoring()
+                self.status_label.configure(text="● Monitoring Active", text_color=GOOD)
+                self.start_button.configure(state="disabled")
+                self.stop_button.configure(state="normal")
+            else:
+                self.stop_monitoring()
+                self.status_label.configure(text="● Monitoring Stopped", text_color=BAD)
+                self.start_button.configure(state="normal")
+                self.stop_button.configure(state="disabled")
+        return _cmd
 
-    self.stop_button = ttk.Button(button_frame, text="⏹ Stop Monitoring", 
-                                 command=self.stop_monitoring, state="disabled", 
-                                 style='Modern.TButton')
-    self.stop_button.pack(side="left", padx=5)
+    self.start_button = ctk.CTkButton(
+        button_frame, text="▶  Start Monitoring", command=wrap_status(True),
+        fg_color=ACCENT, hover_color="#5d84d4", text_color="#0f1117",
+        corner_radius=10, height=38, font=font_bold)
+    self.start_button.pack(side="left", padx=(0, 8))
 
-    export_button = ttk.Button(button_frame, text="💾 Export Data", 
-                              command=self.export_data, style='Modern.TButton')
-    export_button.pack(side="left", padx=5)
+    self.stop_button = ctk.CTkButton(
+        button_frame, text="⏹  Stop Monitoring", command=wrap_status(False),
+        state="disabled", fg_color=CARD_SOFT, hover_color="#2c2f3f",
+        text_color=TEXT, corner_radius=10, height=38, font=font_bold)
+    self.stop_button.pack(side="left", padx=8)
 
-    # Graph Frame with modern styling
-    graph_frame = ttk.LabelFrame(monitor_tab, text="Real-time Resource Usage", 
-                                padding=10)
-    graph_frame.pack(fill="both", expand=True)
+    export_button = ctk.CTkButton(
+        button_frame, text="💾  Export Data", command=self.export_data,
+        fg_color=CARD_SOFT, hover_color="#2c2f3f", text_color=TEXT,
+        corner_radius=10, height=38, font=font_bold)
+    export_button.pack(side="left", padx=8)
 
-    # Create figure with subplots for better organization
-    self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4)) = plt.subplots(2, 2, 
-                                                                          figsize=(12, 8))
-    self.fig.suptitle('System Resource Monitor', fontsize=14, fontweight='bold')
-    
-    # Style the subplots
-    for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
-        ax.grid(True, alpha=0.3)
-        ax.set_facecolor('#fafafa')
-    
-    self.ax1.set_title('CPU Usage', fontweight='bold')
-    self.ax1.set_ylabel('Percentage (%)')
-    
-    self.ax2.set_title('Memory Usage', fontweight='bold')
-    self.ax2.set_ylabel('Percentage (%)')
-    
-    self.ax3.set_title('GPU Usage', fontweight='bold')
-    self.ax3.set_ylabel('Percentage (%)')
-    self.ax3.set_xlabel('Time')
-    
-    self.ax4.set_title('GPU Memory', fontweight='bold')
-    self.ax4.set_ylabel('Percentage (%)')
-    self.ax4.set_xlabel('Time')
+    # ---- 그래프 카드 ----
+    graph_frame = ctk.CTkFrame(monitor_tab, fg_color=CARD, corner_radius=16)
+    graph_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
-    plt.tight_layout()
-    
-    self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
-    self.canvas.get_tk_widget().pack(fill='both', expand=True)
+    ctk.CTkLabel(graph_frame, text="Real-time Resource Usage",
+                 font=font_title, text_color=TEXT).pack(
+        anchor="w", padx=20, pady=(16, 4))
 
-    # ==================== PROCESSES TAB ====================
-    processes_tab = ttk.Frame(self.tab_control)
-    self.tab_control.add(processes_tab, text="🔧 Top Processes")
+    plt.style.use("dark_background")
+    self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+    self.fig.patch.set_facecolor(CARD)
 
-    # Process info frame
-    process_info_frame = ttk.LabelFrame(processes_tab, text="Top 20 Processes by CPU Usage", 
-                                       padding=10)
-    process_info_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    for ax in (self.ax1, self.ax2, self.ax3, self.ax4):
+        ax.set_facecolor("#16171f")
+        ax.grid(True, alpha=0.15, color=TEXT_DIM)
+        ax.tick_params(colors=TEXT_DIM, labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color(TEXT_DIM)
+            spine.set_alpha(0.3)
 
-    # Process list with modern styling
-    process_container = ttk.Frame(process_info_frame)
-    process_container.pack(fill="both", expand=True)
+    self.ax1.set_title("CPU Usage", color=TEXT, fontweight="bold")
+    self.ax1.set_ylabel("Percentage (%)", color=TEXT_DIM)
+    self.ax2.set_title("Memory Usage", color=TEXT, fontweight="bold")
+    self.ax2.set_ylabel("Percentage (%)", color=TEXT_DIM)
+    self.ax3.set_title("GPU Usage", color=TEXT, fontweight="bold")
+    self.ax3.set_ylabel("Percentage (%)", color=TEXT_DIM)
+    self.ax3.set_xlabel("Time", color=TEXT_DIM)
+    self.ax4.set_title("GPU Memory", color=TEXT, fontweight="bold")
+    self.ax4.set_ylabel("Percentage (%)", color=TEXT_DIM)
+    self.ax4.set_xlabel("Time", color=TEXT_DIM)
 
-    process_scrollbar = ttk.Scrollbar(process_container, orient="vertical")
-    process_scrollbar.pack(side="right", fill="y")
+    self.fig.tight_layout(pad=2.0)
 
-    self.process_list = tk.Text(process_container, height=25, state="disabled", 
-                               yscrollcommand=process_scrollbar.set,
-                               font=('Consolas', 9), bg='#fafafa')
-    self.process_list.pack(side="left", fill="both", expand=True)
-    process_scrollbar.config(command=self.process_list.yview)
+    canvas_holder = ctk.CTkFrame(graph_frame, fg_color=CARD, corner_radius=12)
+    canvas_holder.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-    # Export button for processes
-    export_proc_button = ttk.Button(processes_tab, text="💾 Export Processes", 
-                                   command=self.export_top_processes,
-                                   style='Modern.TButton')
-    export_proc_button.pack(pady=10)
+    self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_holder)
+    self.canvas.get_tk_widget().configure(bg=CARD, highlightthickness=0)
+    self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-    # Schedule updates
+    # ======================================================
+    #  PROCESSES TAB (카드 그리드 스타일로 변경)
+    # ======================================================
+    process_card = ctk.CTkFrame(processes_tab, fg_color=CARD, corner_radius=16)
+    process_card.pack(fill="both", expand=True, padx=4, pady=4)
+
+    header_layout_frame = ctk.CTkFrame(process_card, fg_color="transparent")
+    header_layout_frame.pack(fill="x", padx=20, pady=(16, 8))
+
+    ctk.CTkLabel(header_layout_frame, text="Top 20 Processes by CPU Usage",
+                 font=font_title, text_color=TEXT).pack(side="left")
+
+    export_proc_button = ctk.CTkButton(
+        header_layout_frame, text="💾  Export Processes",
+        command=self.export_top_processes,
+        fg_color=ACCENT, hover_color="#5d84d4", text_color="#0f1117",
+        corner_radius=10, height=34, font=font_bold)
+    export_proc_button.pack(side="right")
+
+    # 테이블 헤더 라벨
+    th_frame = ctk.CTkFrame(process_card, fg_color=CARD_SOFT, corner_radius=10, height=36)
+    th_frame.pack(fill="x", padx=16, pady=(0, 6))
+    th_frame.pack_propagate(False)
+
+    ctk.CTkLabel(th_frame, text="PID", font=font_bold, text_color=ACCENT, width=80, anchor="w").pack(side="left", padx=(16, 0))
+    ctk.CTkLabel(th_frame, text="Process Name", font=font_bold, text_color=ACCENT, anchor="w").pack(side="left", expand=True, fill="x", padx=10)
+    ctk.CTkLabel(th_frame, text="CPU Usage", font=font_bold, text_color=ACCENT, width=120, anchor="e").pack(side="right", padx=10)
+    ctk.CTkLabel(th_frame, text="Memory", font=font_bold, text_color=ACCENT, width=120, anchor="e").pack(side="right", padx=(0, 10))
+
+    # 개별 프로세스 카드들이 담길 스크롤 가능한 영역 (여기가 진짜 도시락통 그리드야!)
+    self.process_scroll_frame = ctk.CTkScrollableFrame(
+        process_card, fg_color="#16171f", corner_radius=12,
+        scrollbar_button_color=CARD_SOFT, scrollbar_button_hover_color=ACCENT)
+    self.process_scroll_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
     self.update_process_info()
