@@ -1,9 +1,7 @@
 import customtkinter as ctk
 from tkinter import messagebox
-from utils.utils import gather_system_info
 from .i18n import tr, get_language
 from .tray import is_autostart_enabled
-import requests
 
 # ---- 전역 테마 (바이브코딩 다크 스타일) ----
 ctk.set_appearance_mode("dark")

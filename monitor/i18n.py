@@ -174,6 +174,7 @@ KO = {
         "CPU 평균 {cpu}% · 최고 {cpu_peak}%    메모리 평균 {mem}% · 최고 {mem_peak}%",
     "GPU avg {gpu}% · peak {gpu_peak}%": "GPU 평균 {gpu}% · 최고 {gpu_peak}%",
     "No data": "데이터 없음",
+    "Save monitoring data": "모니터링 데이터 저장",
     "Keep history (days)": "기록 보관 기간 (일)",
     "Older records are deleted": "지난 기록은 자동 삭제",
 

@@ -23,43 +23,120 @@ try:
 except (ImportError, Exception):
     NVML_AVAILABLE = False
 
+class _PdhGpuCounter:
+    """GPU load from the Windows "GPU Engine" performance counters, read in-process (PDH).
+
+    Replaces starting PowerShell every second, which cost a whole new process each sample.
+    Same rule as Task Manager: sum the instances of each engine type, take the busiest type.
+    """
+    PDH_FMT_DOUBLE = 0x00000200
+    PDH_FMT_NOCAP100 = 0x00008000
+    PDH_MORE_DATA = 0x800007D2
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class _Value(ctypes.Union):
+            _fields_ = [("longValue", ctypes.c_long), ("doubleValue", ctypes.c_double),
+                        ("largeValue", ctypes.c_longlong), ("AnsiStringValue", ctypes.c_char_p),
+                        ("WideStringValue", ctypes.c_wchar_p)]
+
+        class _FmtValue(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("CStatus", wintypes.DWORD), ("u", _Value)]
+
+        class _Item(ctypes.Structure):
+            _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _FmtValue)]
+
+        self.ctypes, self.wintypes, self.Item = ctypes, wintypes, _Item
+        pdh = ctypes.WinDLL("pdh")
+        pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_void_p,
+                                              ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        pdh.PdhGetFormattedCounterArrayW.argtypes = [ctypes.c_void_p, wintypes.DWORD,
+                                                     ctypes.POINTER(wintypes.DWORD),
+                                                     ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+        for function in (pdh.PdhOpenQueryW, pdh.PdhAddEnglishCounterW, pdh.PdhCollectQueryData,
+                         pdh.PdhGetFormattedCounterArrayW, pdh.PdhCloseQuery):
+            function.restype = ctypes.c_long
+        self.pdh = pdh
+        self.query = None
+        self.opened_at = 0.0
+        self._open()
+
+    def _open(self):
+        ctypes = self.ctypes
+        self.close()
+        query, counter = ctypes.c_void_p(), ctypes.c_void_p()
+        if self.pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
+            raise OSError("PdhOpenQuery failed")
+        if self.pdh.PdhAddEnglishCounterW(query, r"\GPU Engine(*)\Utilization Percentage", None,
+                                          ctypes.byref(counter)) != 0:
+            self.pdh.PdhCloseQuery(query)
+            raise OSError("GPU Engine counters are not available")
+        self.query, self.counter = query, counter
+        self.pdh.PdhCollectQueryData(query)  # first sample; rates need two
+        self.opened_at = time.time()
+
+    def read(self):
+        ctypes, wintypes = self.ctypes, self.wintypes
+        if time.time() - self.opened_at > 60:
+            self._open()  # picks up GPU engine instances of newly started processes
+            return None
+        if self.pdh.PdhCollectQueryData(self.query) != 0:
+            return None
+        size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+        fmt = self.PDH_FMT_DOUBLE | self.PDH_FMT_NOCAP100
+        status = self.pdh.PdhGetFormattedCounterArrayW(self.counter, fmt, ctypes.byref(size),
+                                                       ctypes.byref(count), None) & 0xFFFFFFFF
+        if status != self.PDH_MORE_DATA or not size.value:
+            return 0.0 if status == 0 else None
+        buffer = (ctypes.c_byte * size.value)()
+        if self.pdh.PdhGetFormattedCounterArrayW(self.counter, fmt, ctypes.byref(size),
+                                                 ctypes.byref(count), buffer) != 0:
+            return None
+        items = ctypes.cast(buffer, ctypes.POINTER(self.Item * count.value)).contents
+        per_engine = {}
+        for item in items:
+            if item.FmtValue.CStatus not in (0, 1):  # PDH_CSTATUS_VALID_DATA / NEW_DATA
+                continue
+            name = item.szName or ""
+            engine = name.rsplit("engtype_", 1)[-1] if "engtype_" in name else "other"
+            per_engine[engine] = per_engine.get(engine, 0.0) + item.FmtValue.doubleValue
+        return min(100.0, max(per_engine.values(), default=0.0))
+
+    def close(self):
+        if self.query:
+            try:
+                self.pdh.PdhCloseQuery(self.query)
+            except Exception:
+                pass
+            self.query = None
+
+
+_pdh_gpu = None
+_pdh_failed = False
+_last_gpu_value = 0.0
+
+
 def get_amd_gpu_info():
-    """Get AMD GPU information using multiple methods"""
-    gpu_usage = 0.0
-    gpu_memory = 0.0
-
-    if platform.system() == 'Windows':
-        try:
-            # FIXED: Add creationflags to prevent console window
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-
-            result = subprocess.run([
-                'powershell', '-Command',
-                '''
-                try {
-                    $counters = Get-Counter "\\GPU Engine(*)\\Utilization Percentage" -ErrorAction Stop
-                    $maxUsage = ($counters.CounterSamples | Measure-Object CookedValue -Maximum).Maximum
-                    Write-Output $maxUsage
-                } catch {
-                    Write-Output "0"
-                }
-                '''
-            ], capture_output=True, text=True, timeout=5,
-               startupinfo=startupinfo,
-               creationflags=subprocess.CREATE_NO_WINDOW)
-
-            if result.returncode == 0 and result.stdout and result.stdout.strip():
-                try:
-                    gpu_usage = float(result.stdout.strip())
-                    gpu_usage = min(max(gpu_usage, 0), 100)
-                except (ValueError, AttributeError):
-                    gpu_usage = 0.0
-        except Exception:
-            pass
-
-    return gpu_usage, gpu_memory
+    """GPU load for non-NVIDIA (AMD/Intel) GPUs via Windows performance counters."""
+    global _pdh_gpu, _pdh_failed, _last_gpu_value
+    if platform.system() != 'Windows' or _pdh_failed:
+        return 0.0, 0.0
+    try:
+        if _pdh_gpu is None:
+            _pdh_gpu = _PdhGpuCounter()
+        value = _pdh_gpu.read()
+        if value is not None:
+            _last_gpu_value = value
+    except Exception:
+        _pdh_failed = True  # counters unavailable on this PC: report 0 instead of retrying
+        _pdh_gpu = None
+    return _last_gpu_value, 0.0
 
 def get_gpu_info():
     """Get GPU usage information with AMD support"""
@@ -224,7 +301,7 @@ def monitor_resources(self):
                             self.update_metric_values(cpu, mem, gpu, gpu_mem))
 
             if getattr(self, "remote_client", None):
-                self.process_queue.put(sample.get("processes", []))
+                self._publish_processes(sample.get("processes", []))
                 scope_titles = {
                     "agent_app_only": "Top Processes (Android app only)",
                     "recent_apps": "Recently Used Apps (Android)",
@@ -266,95 +343,3 @@ def monitor_resources(self):
 
         except Exception:
             pass
-
-def update_graph(self):
-    """Update the resource usage graphs"""
-    while self.monitoring:
-        try:
-            for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
-                ax.clear()
-                ax.grid(True, alpha=0.3)
-                ax.set_facecolor('#fafafa')
-
-            recent_length = min(60, len(self.all_time_history))
-            if recent_length > 0:
-                time_data = self.all_time_history[-recent_length:]
-                cpu_data = self.all_cpu_history[-recent_length:]
-                memory_data = self.all_memory_history[-recent_length:]
-                gpu_data = self.all_gpu_history[-recent_length:]
-                gpu_memory_data = self.all_gpu_memory_history[-recent_length:]
-
-                self.ax1.plot(range(len(cpu_data)), cpu_data,
-                             color='#0078d4', linewidth=2, label='CPU Usage')
-                self.ax1.axhline(y=self.CPU_THRESHOLD, color='#d13438',
-                               linestyle='--', alpha=0.7, label=f'Threshold ({self.CPU_THRESHOLD}%)')
-                self.ax1.set_title('CPU Usage', fontweight='bold')
-                self.ax1.set_ylabel('Percentage (%)')
-                self.ax1.set_ylim(0, 100)
-                self.ax1.legend()
-
-                self.ax2.plot(range(len(memory_data)), memory_data,
-                             color='#107c10', linewidth=2, label='Memory Usage')
-                self.ax2.axhline(y=self.MEMORY_THRESHOLD, color='#d13438',
-                               linestyle='--', alpha=0.7, label=f'Threshold ({self.MEMORY_THRESHOLD}%)')
-                self.ax2.set_title('Memory Usage', fontweight='bold')
-                self.ax2.set_ylabel('Percentage (%)')
-                self.ax2.set_ylim(0, 100)
-                self.ax2.legend()
-
-                gpu_detected = check_gpu_existence()
-                has_gpu_data = any(x > 0.0 for x in gpu_data)
-
-                if gpu_detected:
-                    self.ax3.plot(range(len(gpu_data)), gpu_data,
-                                 color='#ca5010', linewidth=2, label='GPU Usage')
-
-                    if has_gpu_data:
-                        self.ax3.axhline(y=self.GPU_THRESHOLD, color='#d13438',
-                                       linestyle='--', alpha=0.7, label=f'Threshold ({self.GPU_THRESHOLD}%)')
-
-                    if not has_gpu_data:
-                        self.ax3.text(0.5, 0.3, 'GPU Detected\n(Idle or Limited Monitoring)',
-                                     transform=self.ax3.transAxes, ha='center', va='center',
-                                     fontsize=10, alpha=0.7)
-
-                    self.ax3.legend()
-                else:
-                    self.ax3.text(0.5, 0.5, 'No Dedicated GPU\nDetected',
-                                 transform=self.ax3.transAxes, ha='center', va='center',
-                                 fontsize=12, alpha=0.6)
-
-                self.ax3.set_title('GPU Usage', fontweight='bold')
-                self.ax3.set_ylabel('Percentage (%)')
-                self.ax3.set_xlabel('Time')
-                self.ax3.set_ylim(0, 100)
-
-                has_gpu_memory_data = any(x > 0.0 for x in gpu_memory_data)
-
-                if gpu_detected:
-                    self.ax4.plot(range(len(gpu_memory_data)), gpu_memory_data,
-                                 color='#8764b8', linewidth=2, label='GPU Memory')
-
-                    if not has_gpu_memory_data:
-                        self.ax4.text(0.5, 0.3, 'GPU Memory\n(Limited Monitoring)',
-                                     transform=self.ax4.transAxes, ha='center', va='center',
-                                     fontsize=10, alpha=0.7)
-
-                    self.ax4.legend()
-                else:
-                    self.ax4.text(0.5, 0.5, 'No GPU Memory\nMonitoring Available',
-                                 transform=self.ax4.transAxes, ha='center', va='center',
-                                 fontsize=12, alpha=0.6)
-
-                self.ax4.set_title('GPU Memory', fontweight='bold')
-                self.ax4.set_ylabel('Percentage (%)')
-                self.ax4.set_xlabel('Time')
-                self.ax4.set_ylim(0, 100)
-
-            import matplotlib.pyplot as plt
-            self.canvas.draw_idle()
-
-        except Exception:
-            pass
-
-        time.sleep(1)

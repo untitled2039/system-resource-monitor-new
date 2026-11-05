@@ -25,6 +25,7 @@ class HistoryStore:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA cache_size=-512")  # 512 KB page cache (default is 2 MB)
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS samples (
                 ts REAL NOT NULL, device TEXT NOT NULL,

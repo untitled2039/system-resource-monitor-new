@@ -5,12 +5,14 @@ from collections import deque
 import threading
 from tkinter import messagebox
 from utils.utils import export_data
-from .monitor import monitor_resources, update_graph
+from .monitor import monitor_resources
 from .gui import create_gui
 import psutil
 import queue
 import time
-from concurrent.futures import ThreadPoolExecutor
+import gc
+import heapq
+import sys
 from .remote_link import PairingServer, TCP_PORT, local_ipv4_addresses
 from . import ai_insights
 from . import i18n
@@ -21,6 +23,8 @@ from .history import HistoryStore, LOCAL_DEVICE
 from .tray import TrayIcon, set_autostart
 
 class ResourceMonitor:
+    SESSION_SAMPLES = 3600  # in-memory samples kept for export fallback (about 1 hour)
+
     def __init__(self, current_version):
         self.CURRENT_VERSION = current_version
         self.alert_settings = load_settings()
@@ -37,11 +41,12 @@ class ResourceMonitor:
         self.gpu_memory_history = deque(maxlen=self.HISTORY_LENGTH)
         self.time_history = deque(maxlen=self.HISTORY_LENGTH)
 
-        self.all_cpu_history = []
-        self.all_memory_history = []
-        self.all_gpu_history = []
-        self.all_gpu_memory_history = []
-        self.all_time_history = []
+        # Capped: long-term data lives in the SQLite history, so RAM no longer grows over days.
+        self.all_cpu_history = deque(maxlen=self.SESSION_SAMPLES)
+        self.all_memory_history = deque(maxlen=self.SESSION_SAMPLES)
+        self.all_gpu_history = deque(maxlen=self.SESSION_SAMPLES)
+        self.all_gpu_memory_history = deque(maxlen=self.SESSION_SAMPLES)
+        self.all_time_history = deque(maxlen=self.SESSION_SAMPLES)
 
         self.monitoring = False
         self.remote_client = None
@@ -53,6 +58,11 @@ class ResourceMonitor:
         self._auto_insight_job = None
         self._windowed_geometry = None
         self._tray_hint_shown = False
+        self._window_visible = True
+        self._process_rows = []
+        self._process_dirty = False
+        self._history_rows = []
+        self._history_since = 0.0
         self._auto_cleaning = False
         self._history_canvas = None
         self._history_error = ""
@@ -60,7 +70,7 @@ class ResourceMonitor:
             self.history = HistoryStore()
         except Exception as exc:  # e.g. AppData not writable
             self.history, self._history_error = None, str(exc)
-        self.process_queue = queue.Queue()
+        self.process_queue = queue.Queue(maxsize=1)  # only the newest list is kept
         self.process_monitoring_thread = None
         self.theme_mode = "dark"
         self.good_color = "#9ece6a"
@@ -90,6 +100,7 @@ class ResourceMonitor:
         self.tray = TrayIcon(self)
         self.tray.start()
         self.root.after(1500, self._history_tick)
+        self.root.after(300_000, self._idle_trim_tick)
 
     def _monitor_rect(self):
         """Physical pixel rectangle of the monitor the window is on (Windows), else screen size."""
@@ -230,61 +241,81 @@ class ResourceMonitor:
         recolor(self.root)
         if self.pairing_dialog and self.pairing_dialog.winfo_exists():
             recolor(self.pairing_dialog)
+        self._process_dirty = True
         if self._history_canvas is not None:
             self.refresh_history()
 
-    def update_process_info(self):
+    def _publish_processes(self, processes):
+        """Keep only the newest process list (older ones are dropped, not queued up)."""
         try:
-            # 1. 큐에서 정렬된 프로세스 데이터(리스트) 가져오기
-            all_sorted_processes = self.process_queue.get_nowait()
-            self.latest_processes = list(all_sorted_processes)
-
-            # 2. 기존에 그려져 있던 카드들 싹 지우기 (초기화)
-            for widget in self.process_scroll_frame.winfo_children():
-                widget.destroy()
-
-            font_row = ctk.CTkFont(family="Segoe UI", size=13)
-            font_mono = ctk.CTkFont(family="Consolas", size=12, weight="bold")
-            dark = self.theme_mode == "dark"
-
-            # 3. 프로세스 개수만큼 예쁜 둥근 카드(도시락통) 한 줄씩 생성해서 꽂기
-            for idx, proc in enumerate(all_sorted_processes):
-                # 카드 배경 색상 (번갈아가며 살짝 다르게 주면 가독성이 좋아져!)
-                row_bg = (
-                    ("#1a1b26" if idx % 2 == 0 else "#20222e") if dark
-                    else ("#ffffff" if idx % 2 == 0 else "#edf1f7")
-                )
-
-                row_card = ctk.CTkFrame(self.process_scroll_frame, fg_color=row_bg, corner_radius=8, height=40)
-                row_card.pack(fill="x", pady=3, padx=2)
-                row_card.pack_propagate(False)
-
-                # PID 정보
-                main_text = "#c0caf5" if dark else "#202b3c"
-                pid_lbl = ctk.CTkLabel(row_card, text="—" if proc.get('pid') is None else str(proc['pid']), font=font_mono, text_color=main_text, width=80, anchor="w")
-                pid_lbl.pack(side="left", padx=(12, 0))
-
-                # 프로세스 이름 정보
-                name_lbl = ctk.CTkLabel(row_card, text=str(proc['name']), font=font_row, text_color=main_text, anchor="w")
-                name_lbl.pack(side="left", expand=True, fill="x", padx=10)
-
-                # 메모리 사용량 정보
-                mem_val = "—" if proc.get('memory_percent') is None else f"{proc['memory_percent']:.2f}%"
-                mem_lbl = ctk.CTkLabel(row_card, text=mem_val, font=font_row, text_color="#9ece6a" if dark else "#21804a", width=120, anchor="e")
-                mem_lbl.pack(side="right", padx=10)
-
-                # CPU 사용량 정보
-                cpu_val = ("—" if proc.get('cpu_percent_normalized') is None
-                           else f"{proc['cpu_percent_normalized']:.2f}%")
-                cpu_lbl = ctk.CTkLabel(row_card, text=cpu_val, font=font_row, text_color="#7aa2f7" if dark else "#315fb8", width=120, anchor="e")
-                cpu_lbl.pack(side="right", padx=(0, 10))
-
+            while True:
+                self.process_queue.get_nowait()
         except queue.Empty:
             pass
-        except Exception as e:
-            # 혹시 모를 에러 방어
+        try:
+            self.process_queue.put_nowait(processes)
+        except queue.Full:
             pass
 
+    def _ensure_process_rows(self):
+        """Create the 20 row widgets once; later refreshes only change their text."""
+        if self._process_rows:
+            return
+        font_row = ctk.CTkFont(family="Segoe UI", size=13)
+        font_mono = ctk.CTkFont(family="Consolas", size=12, weight="bold")
+        for _ in range(20):
+            card = ctk.CTkFrame(self.process_scroll_frame, corner_radius=8, height=40)
+            card.pack_propagate(False)
+            pid = ctk.CTkLabel(card, text="", font=font_mono, width=80, anchor="w")
+            pid.pack(side="left", padx=(12, 0))
+            name = ctk.CTkLabel(card, text="", font=font_row, anchor="w")
+            name.pack(side="left", expand=True, fill="x", padx=10)
+            mem = ctk.CTkLabel(card, text="", font=font_row, width=120, anchor="e")
+            mem.pack(side="right", padx=10)
+            cpu = ctk.CTkLabel(card, text="", font=font_row, width=120, anchor="e")
+            cpu.pack(side="right", padx=(0, 10))
+            self._process_rows.append((card, pid, name, mem, cpu))
+
+    def _render_process_rows(self):
+        self._ensure_process_rows()
+        dark = self.theme_mode == "dark"
+        main_text = "#c0caf5" if dark else "#202b3c"
+        mem_color = "#9ece6a" if dark else "#21804a"
+        cpu_color = "#7aa2f7" if dark else "#315fb8"
+        processes = self.latest_processes[:20]
+        for idx, (card, pid, name, mem, cpu) in enumerate(self._process_rows):
+            if idx >= len(processes):
+                if card.winfo_manager():
+                    card.pack_forget()
+                continue
+            proc = processes[idx]
+            row_bg = (("#1a1b26" if idx % 2 == 0 else "#20222e") if dark
+                      else ("#ffffff" if idx % 2 == 0 else "#edf1f7"))
+            card.configure(fg_color=row_bg)
+            pid.configure(text="—" if proc.get('pid') is None else str(proc['pid']), text_color=main_text)
+            name.configure(text=str(proc.get('name')), text_color=main_text)
+            mem.configure(text="—" if proc.get('memory_percent') is None else f"{proc['memory_percent']:.2f}%",
+                          text_color=mem_color)
+            cpu.configure(text=("—" if proc.get('cpu_percent_normalized') is None
+                                else f"{proc['cpu_percent_normalized']:.2f}%"), text_color=cpu_color)
+            if not card.winfo_manager():
+                card.pack(fill="x", pady=3, padx=2)
+
+    def update_process_info(self):
+        try:
+            try:
+                processes = self.process_queue.get_nowait()
+            except queue.Empty:
+                processes = None
+            if processes is not None:
+                self.latest_processes = list(processes)
+                self._process_dirty = True
+            if (self._process_dirty and self._window_visible
+                    and self.tab_control.get() == tr("🔧 Top Processes")):
+                self._render_process_rows()
+                self._process_dirty = False
+        except Exception:
+            pass
         self.root.after(1000, self.update_process_info)
 
     def export_top_processes(self):
@@ -457,6 +488,8 @@ class ResourceMonitor:
         """Window X button: hide to the tray (if enabled and available) or quit."""
         if self.alert_settings.get("minimize_to_tray") and self.tray.available:
             self.root.withdraw()
+            self._window_visible = False
+            self.root.after(2000, self._trim_own_memory)
             if not self._tray_hint_shown:
                 self._tray_hint_shown = True
                 self.tray.notify(tr("System Resource Monitor"),
@@ -465,6 +498,8 @@ class ResourceMonitor:
             self.quit_app()
 
     def show_window(self):
+        self._window_visible = True
+        self._process_dirty = True
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -492,6 +527,28 @@ class ResourceMonitor:
         self._set_status(True)
         if self.tray.available:
             self.root.withdraw()
+            self._window_visible = False
+            self.root.after(5000, self._trim_own_memory)
+
+    def _trim_own_memory(self):
+        """While hidden: free Python garbage and hand unused pages of this app back to Windows."""
+        gc.collect()
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+            kernel32.SetProcessWorkingSetSize(kernel32.GetCurrentProcess(),
+                                              ctypes.c_size_t(-1).value, ctypes.c_size_t(-1).value)
+        except Exception:
+            pass
+
+    def _idle_trim_tick(self):
+        if not self._window_visible:
+            self._trim_own_memory()
+        self.root.after(300_000, self._idle_trim_tick)
 
     def save_background_options(self):
         self.alert_settings["minimize_to_tray"] = bool(self.tray_switch.get())
@@ -556,53 +613,75 @@ class ResourceMonitor:
         self._draw_history_chart(self.history.series(device, since), since)
 
     def _draw_history_chart(self, rows, since):
-        from datetime import datetime
-        import matplotlib
-        import matplotlib.dates as mdates
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        """Line chart drawn on a plain tk.Canvas (no matplotlib/numpy: about 50 MB less RAM)."""
+        if self._history_canvas is None:
+            canvas = tk.Canvas(self.history_chart_frame, highlightthickness=0, bd=0)
+            canvas.pack(fill="both", expand=True, padx=10, pady=10)
+            canvas.bind("<Configure>", lambda _event: self._render_history_chart())
+            self._history_canvas = canvas
+        self._history_rows, self._history_since = rows, since
+        self._render_history_chart()
 
-        matplotlib.rcParams["font.family"] = ["Malgun Gothic", "DejaVu Sans"]
-        matplotlib.rcParams["axes.unicode_minus"] = False
+    def _render_history_chart(self):
+        canvas = self._history_canvas
+        if canvas is None:
+            return
         dark = self.theme_mode == "dark"
         background = "#20222e" if dark else "#edf1f7"
         foreground = "#c0caf5" if dark else "#202b3c"
         grid = "#34384a" if dark else "#cad3e0"
-        if self._history_canvas is None:
-            self._history_figure = Figure(figsize=(8, 3), dpi=100)
-            self._history_axes = self._history_figure.add_subplot(111)
-            self._history_canvas = FigureCanvasTkAgg(self._history_figure, master=self.history_chart_frame)
-            self._history_canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
-        figure, axes = self._history_figure, self._history_axes
-        axes.clear()
-        figure.patch.set_facecolor(background)
-        axes.set_facecolor(background)
-        self._history_canvas.get_tk_widget().configure(bg=background, highlightthickness=0)
-        if rows:
-            times = [datetime.fromtimestamp(row[0]) for row in rows]
-            axes.plot(times, [row[1] for row in rows], color="#7aa2f7" if dark else "#315fb8",
-                      linewidth=1.6, label="CPU")
-            axes.plot(times, [row[2] for row in rows], color="#9ece6a" if dark else "#21804a",
-                      linewidth=1.6, label=tr("Memory"))
-            gpu = [row[3] for row in rows]
-            if any(value for value in gpu if value):
-                axes.plot(times, gpu, color="#ff9e64" if dark else "#b85c18", linewidth=1.2, label="GPU")
-            span = time.time() - since
-            axes.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M" if span <= 2 * 86400 else "%m-%d"))
-            legend = axes.legend(loc="upper left", frameon=False, ncol=3)
-            for text in legend.get_texts():
-                text.set_color(foreground)
-        else:
-            axes.text(0.5, 0.5, tr("No data"), ha="center", va="center", color=foreground,
-                      transform=axes.transAxes)
-        axes.set_ylim(0, 100)
-        axes.set_ylabel("%", color=foreground)
-        axes.tick_params(colors=foreground, labelsize=9)
-        axes.grid(True, color=grid, linewidth=0.6)
-        for spine in axes.spines.values():
-            spine.set_color(grid)
-        figure.tight_layout()
-        self._history_canvas.draw_idle()
+        canvas.configure(bg=background)
+        canvas.delete("all")
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width < 120 or height < 80:
+            return
+        left, right, top, bottom = 46, 16, 30, 26
+        plot_w, plot_h = width - left - right, height - top - bottom
+        small = ("Segoe UI", 9)
+        for value in (0, 25, 50, 75, 100):
+            y = top + plot_h * (1 - value / 100)
+            canvas.create_line(left, y, width - right, y, fill=grid)
+            canvas.create_text(left - 6, y, text=f"{value}%", anchor="e", fill=foreground, font=small)
+        rows = self._history_rows
+        if not rows:
+            canvas.create_text(width / 2, height / 2, text=tr("No data"), fill=foreground, font=("Segoe UI", 11))
+            return
+        start, end = self._history_since, time.time()
+        span = max(1.0, end - start)
+        x_of = lambda t: left + (t - start) / span * plot_w
+        y_of = lambda v: top + plot_h * (1 - max(0.0, min(100.0, v)) / 100)
+        gap = max(60.0, span / 600 * 3)  # break the line where the app was not running
+        series = [(1, "CPU", "#7aa2f7" if dark else "#315fb8"),
+                  (2, tr("Memory"), "#9ece6a" if dark else "#21804a")]
+        if any(row[3] for row in rows if row[3]):
+            series.append((3, "GPU", "#ff9e64" if dark else "#b85c18"))
+        for index, _label, color in series:
+            points, last_t = [], None
+            for row in rows:
+                value = row[index]
+                if value is None or (last_t is not None and row[0] - last_t > gap):
+                    if len(points) >= 4:
+                        canvas.create_line(*points, fill=color, width=2)
+                    points = []
+                if value is not None:
+                    points += [x_of(row[0]), y_of(value)]
+                last_t = row[0]
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=color, width=2)
+            elif len(points) == 2:
+                canvas.create_oval(points[0] - 2, points[1] - 2, points[0] + 2, points[1] + 2, fill=color, outline=color)
+        x = left
+        for _index, label, color in series:
+            canvas.create_line(x, 12, x + 16, 12, fill=color, width=3)
+            item = canvas.create_text(x + 22, 12, text=label, anchor="w", fill=foreground, font=small)
+            bbox = canvas.bbox(item)
+            x = (bbox[2] if bbox else x + 60) + 18
+        time_format = "%H:%M" if span <= 2 * 86400 else "%m-%d"
+        for i in range(5):
+            t = start + span * i / 4
+            anchor = "nw" if i == 0 else ("ne" if i == 4 else "n")
+            canvas.create_text(x_of(t), height - bottom + 6, text=time.strftime(time_format, time.localtime(t)),
+                               anchor=anchor, fill=foreground, font=small)
 
     def _history_tick(self):
         """Refresh the History tab once a minute while it is visible."""
@@ -935,48 +1014,50 @@ class ResourceMonitor:
         dialog.after(100, entry.focus_set)
 
     def monitor_top_processes(self):
-        """Monitor all processes and order them by CPU usage."""
-        def monitor_chunk(process_chunk):
-            processes = []
-            for proc in process_chunk:
-                try:
-                    cpu_percent = proc.info['cpu_percent'] / psutil.cpu_count()
-                    proc.info['cpu_percent_normalized'] = cpu_percent
-                    processes.append(proc.info)
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-            return processes
-
+        """Top 20 processes by CPU. Paused while the window is hidden or a remote device is shown."""
+        cpu_count = max(1, psutil.cpu_count() or 1)
         while self.monitoring:
             try:
-                if getattr(self, "remote_client", None):
-                    time.sleep(1)
+                if getattr(self, "remote_client", None) or not self._window_visible:
+                    time.sleep(2)
                     continue
-                all_processes = list(psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']))
-
-                chunk_size = max(1, len(all_processes) // 5)
-                process_chunks = [all_processes[i:i + chunk_size]
-                                  for i in range(0, len(all_processes), chunk_size)]
-
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    results = executor.map(monitor_chunk, process_chunks)
-
-                all_sorted_processes = sorted(
-                    [proc for chunk in results for proc in chunk],
-                    key=lambda p: p['cpu_percent_normalized'],
-                    reverse=True
-                )[:20]
-
-                self.process_queue.put(all_sorted_processes)
-
-            except Exception as e:
-                messagebox.showerror("Error",
-                                   f"Error monitoring processes: {e}")
-
+                rows = []
+                for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                    info = proc.info
+                    cpu = info.get('cpu_percent')
+                    if cpu is None:
+                        continue
+                    rows.append({'pid': info['pid'], 'name': info.get('name') or 'Unknown',
+                                 'cpu_percent_normalized': cpu / cpu_count,
+                                 'memory_percent': info.get('memory_percent') or 0.0})
+                self._publish_processes(heapq.nlargest(20, rows, key=lambda p: p['cpu_percent_normalized']))
+                del rows
+            except Exception:
+                pass
             time.sleep(2)
 
     def export_data(self):
-        export_data(self)
+        """Export the last 24 hours from the SQLite history (falls back to the in-memory samples)."""
+        if not self.history:
+            export_data(self)
+            return
+        from tkinter import filedialog
+        import csv
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")],
+                                            title=tr("Save monitoring data"))
+        if not path:
+            return
+        self.history.flush()
+        device = (self.remote_device_name or "Remote device") if self.remote_client else LOCAL_DEVICE
+        since = time.time() - 86400
+        rows = self.history.series(device, since, max_points=86400)
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["Time", "CPU (%)", "Memory (%)", "GPU (%)", "GPU Memory (%)"])
+            for ts, cpu, mem, gpu, gpu_mem in rows:
+                fmt = lambda v: "" if v is None else f"{v:.1f}"
+                writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+                                 fmt(cpu), fmt(mem), fmt(gpu), fmt(gpu_mem)])
 
     def cleanup(self):
         self.monitoring = False

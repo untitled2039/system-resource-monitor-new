@@ -24,7 +24,8 @@ if (Test-Path (Join-Path $root "dist")) {
 & $Python -m PyInstaller --noconfirm --clean --windowed --onedir `
     --distpath (Join-Path $root "dist\app") `
     --name SystemResourceMonitor `
-    --collect-all customtkinter --collect-all matplotlib --collect-all mpl_toolkits `
+    --collect-all customtkinter `
+    --exclude-module matplotlib --exclude-module numpy `
     --hidden-import=plyer.platforms.win.notification `
     --hidden-import=pystray._win32 `
     main.py
